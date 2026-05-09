@@ -1,0 +1,68 @@
+name: Build & Deploy
+on: [push]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repository if not exists
+        run: |
+          aws ecr describe-repositories --repository-names ${{ secrets.ECR_REPOSITORY }} 2>/dev/null || \
+          aws ecr create-repository --repository-name ${{ secrets.ECR_REPOSITORY }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Docker Image
+        run: |
+          IMAGE="${{ steps.ecr-login.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ github.sha }}"
+          IMAGE_LATEST="${{ steps.ecr-login.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:latest"
+          docker build -t "$IMAGE" -t "$IMAGE_LATEST" .
+          docker push "$IMAGE"
+          docker push "$IMAGE_LATEST"
+
+
+      - name: Trigger Stelm auto-deploy
+        if: success()
+        env:
+          ZT_DEPLOY_TOKEN: ${{ secrets.ZT_DEPLOY_TOKEN }}
+          ZT_API_URL: ${{ secrets.ZT_API_URL }}
+          ZT_PROJECT_ID: ${{ secrets.ZT_PROJECT_ID }}
+          ZT_RESOURCE_ID: ${{ secrets.ZT_RESOURCE_ID }}
+        run: |
+          # Fire-and-forget: webhook failure must NOT fail CI — the
+          # image is already in ECR, so a missed roll just means the
+          # user has to click Re-deploy on the Stelm platform
+          # manually. Skip cleanly when secrets aren't configured
+          # (e.g. project was scaffolded before auto-deploy existed).
+          if [ -z "$ZT_DEPLOY_TOKEN" ] || [ -z "$ZT_API_URL" ]; then
+            echo "Stelm auto-deploy not configured (skipping)"
+            exit 0
+          fi
+          PAYLOAD=$(jq -n \
+            --arg tag "${{ github.sha }}" \
+            --arg msg "${{ github.event.head_commit.message }}" \
+            '{image_tag: $tag, commit_sha: $tag, commit_message: $msg}')
+          curl -fsS --max-time 30 -X POST \
+            -H "Authorization: Bearer $ZT_DEPLOY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$ZT_API_URL/api/projects/$ZT_PROJECT_ID/components/$ZT_RESOURCE_ID/refresh-image" \
+            || echo "Stelm auto-deploy webhook failed; image still in ECR. Click Re-deploy on the platform to roll."
